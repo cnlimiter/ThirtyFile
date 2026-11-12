@@ -1,0 +1,133 @@
+name: Windows AMD64 single file
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/windows-amd64-single-file]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-single-file-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      PYTHONUTF8: '1'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Record Windows environment
+        run: |
+          New-Item -ItemType Directory -Force evidence, dist | Out-Null
+          Get-ComputerInfo -Property WindowsProductName, WindowsVersion, OsBuildNumber, OsArchitecture | Out-File evidence/environment.txt
+          git rev-parse HEAD | Out-File evidence/source-commit.txt
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'Expected native AMD64 runner' }
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: web/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Build embedded frontend and its notices
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          pnpm build
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          pnpm licenses list --prod --json > ../evidence/licenses-prod.json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          pnpm licenses list --dev --json > ../evidence/licenses-dev.json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node scripts/third-party-notices.mjs ../evidence/licenses-prod.json ../evidence/licenses-dev.json > ../evidence/notices-web.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Prepare native build tools
+        working-directory: server
+        run: |
+          rustup toolchain install
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          choco install nasm --no-progress -y
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          'C:\Program Files\NASM' >> $env:GITHUB_PATH
+          cmake --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: server
+          key: windows-static-crt
+      - name: Build Windows x64 release with static CRT
+        working-directory: server
+        env:
+          RUSTFLAGS: '-C target-feature=+crt-static'
+          AWS_LC_SYS_STATIC: '1'
+          THIRTYFILE_VERSION: ci-${{ github.sha }}
+        run: |
+          cargo build --release --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item target/x86_64-pc-windows-msvc/release/thirtyfile.exe ../dist/thirtyfile-windows-amd64.exe
+      - name: Generate Windows dependency license notices
+        working-directory: server
+        run: |
+          cargo install cargo-about --version 0.9.2 --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          (Get-Content about.toml -Raw).Replace('targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]', 'targets = ["x86_64-pc-windows-msvc"]') | Set-Content about-windows.toml
+          cargo fetch --locked
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo about generate --offline --locked --fail -c about-windows.toml -o ../evidence/notices-rust.txt about.hbs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item ../LICENSE ../dist/LICENSE
+          $rust = Get-Content ../evidence/notices-rust.txt -Raw
+          $web = Get-Content ../evidence/notices-web.txt -Raw
+          "ThirtyFile includes the following third-party software.`n`n$rust`n`n$web" | Set-Content ../dist/THIRD-PARTY-NOTICES -Encoding utf8NoBOM
+          Copy-Item ../scripts/README-windows-single-file.md ../dist/README.md
+      - name: Verify PE AMD64 and imported libraries
+        run: |
+          python scripts/check-windows-pe.py dist/thirtyfile-windows-amd64.exe --evidence evidence
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          if (!$dumpbin) { throw 'dumpbin was not found' }
+          & $dumpbin.FullName /dependents dist/thirtyfile-windows-amd64.exe | Tee-Object evidence/pe-dependents.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $imports = Get-Content evidence/pe-dependents.txt -Raw
+          if ($imports -match '(?i)(VCRUNTIME|MSVCP|MSVCR|ucrtbase|api-ms-win-crt)[^\s]*\.dll') { throw 'Executable imports a C/C++ runtime DLL despite static CRT configuration' }
+          $dlls = [regex]::Matches($imports, '(?im)^\s+([\w.-]+\.dll)\s*$') | ForEach-Object { $_.Groups[1].Value }
+          if (!$dlls) { throw 'No DLL imports were captured' }
+          foreach ($dll in $dlls) {
+            if (!(Test-Path "$env:WINDIR\System32\$dll") -and $dll -notlike 'api-ms-win-*' -and $dll -notlike 'ext-ms-win-*') { throw "Non-system DLL dependency: $dll" }
+          }
+          ./dist/thirtyfile-windows-amd64.exe --version | Tee-Object evidence/version.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/check-windows-pe.py dist/thirtyfile-windows-amd64.exe --evidence evidence --write-checksums
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Run standalone Windows smoke
+        run: |
+          python scripts/smoke-single-file.py dist/thirtyfile-windows-amd64.exe --evidence evidence
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/check-windows-pe.py dist/thirtyfile-windows-amd64.exe --evidence evidence --verify-checksums
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Upload tested Windows program
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: thirtyfile-windows-amd64-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Keep Windows validation evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-single-file-evidence-${{ github.sha }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 14

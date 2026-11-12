@@ -56,7 +56,23 @@ def main():
         nonlocal process
         if process is None:
             return
-        process.send_signal(signal.SIGTERM)
+        if os.name == "nt":
+            # A helper joins only the child's console, so Ctrl+C cannot reach the CI runner.
+            helper = """import ctypes, sys
+kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+kernel.FreeConsole()
+if not kernel.AttachConsole(int(sys.argv[1])):
+    raise ctypes.WinError(ctypes.get_last_error())
+if not kernel.SetConsoleCtrlHandler(None, True):
+    raise ctypes.WinError(ctypes.get_last_error())
+if not kernel.GenerateConsoleCtrlEvent(0, 0):
+    raise ctypes.WinError(ctypes.get_last_error())
+kernel.FreeConsole()
+"""
+            import sys
+            subprocess.run([sys.executable, "-c", helper, str(process.pid)], check=True, timeout=10)
+        else:
+            process.send_signal(signal.SIGTERM)
         try:
             code = process.wait(timeout=20)
         except subprocess.TimeoutExpired:
@@ -65,12 +81,13 @@ def main():
             process = None
             raise AssertionError("server did not stop within 20 seconds")
         process = None
-        checked(code == 0, "server exits cleanly on SIGTERM")
+        event = "Ctrl+C" if os.name == "nt" else "SIGTERM"
+        checked(code == 0, f"server exits cleanly on {event}")
 
     try:
-        with tempfile.TemporaryDirectory(prefix="thirtyfile-single-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="thirtyfile 中文 single ") as temporary:
             root = Path(temporary)
-            binary = root / "thirtyfile"
+            binary = root / ("thirtyfile.exe" if os.name == "nt" else "thirtyfile")
             shutil.copy2(source, binary)
             binary.chmod(0o755)
             checked(list(root.iterdir()) == [binary], "clean working directory initially contains only the executable")
@@ -113,7 +130,10 @@ def main():
 
             def start(log):
                 nonlocal process
-                process = subprocess.Popen([str(binary)], cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT)
+                process = subprocess.Popen(
+                    [str(binary)], cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT,
+                    creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0,
+                )
                 deadline = time.monotonic() + 90
                 while time.monotonic() < deadline:
                     if process.poll() is not None:
@@ -167,7 +187,10 @@ def main():
                 checked(json_request("/api/branding")["site_name"] == branding["site_name"], "configuration survives a restart")
                 checked((root / "data/secret.key").is_file(), "persistent encryption key exists in the data directory")
                 stop()
-            records = [json.loads(line) for line in (evidence / "startup.jsonl").read_text().splitlines() if line.startswith("{")]
+            for filename in ["startup.jsonl", "restart.jsonl"]:
+                log_text = (evidence / filename).read_text(encoding="utf-8")
+                checked('"Stopped"' in log_text, f"graceful shutdown is recorded in {filename}")
+            records = [json.loads(line) for line in (evidence / "startup.jsonl").read_text(encoding="utf-8").splitlines() if line.startswith("{")]
             versions = [record.get("fields", {}).get("sqlite_version_number", 0) for record in records]
             checked(any(version >= 3054000 for version in versions), "linked SQLite runtime passes the patched-version check")
         report["status"] = "passed"
@@ -178,7 +201,7 @@ def main():
         if process is not None and process.poll() is None:
             process.kill()
             process.wait(timeout=10)
-        (evidence / "smoke-result.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+        (evidence / "smoke-result.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
