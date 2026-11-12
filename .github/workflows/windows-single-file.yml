@@ -78,7 +78,10 @@ jobs:
       - name: Generate Windows dependency license notices
         working-directory: server
         run: |
-          cargo install cargo-about --version 0.9.2 --locked
+          cargo install cargo-about --version 0.9.2 --locked --features cli
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          if (!(Get-Command cargo-about -ErrorAction SilentlyContinue)) { throw 'cargo-about was not installed' }
+          cargo about --version
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           (Get-Content about.toml -Raw).Replace('targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]', 'targets = ["x86_64-pc-windows-msvc"]') | Set-Content about-windows.toml
           cargo fetch --locked
